@@ -66,11 +66,27 @@ export function registerChartTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
+  server.tool('option_chain_get_state', 'Open the TradingView options-chain view if needed and read the full visible option context end to end', {}, async () => {
+    try { return jsonResult(await core.readVisibleOptionChain()); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
   server.tool('symbol_search', 'Search for symbols by name or keyword', {
     query: z.string().describe('Search query (e.g., "AAPL", "crude oil", "ES")'),
     type: z.string().optional().describe('Filter by type (e.g., "stock", "futures", "crypto", "forex")'),
   }, async ({ query, type }) => {
     try { return jsonResult(await core.symbolSearch({ query, type })); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.tool('resolve_option_symbol', 'Resolve a canonical TradingView-style option symbol from the underlying, expiry, strike, and option type', {
+    underlying: z.string().describe('Underlying symbol (e.g., NIFTY, BANKNIFTY)'),
+    expiry: z.string().describe('Expiry date in ISO format (YYYY-MM-DD)'),
+    strike: z.coerce.number().describe('Strike price'),
+    optionType: z.string().describe('Option type: CE or PE'),
+    exchange: z.string().optional().describe('Exchange prefix (e.g., NSE)'),
+  }, async ({ underlying, expiry, strike, optionType, exchange }) => {
+    try { return jsonResult(await core.resolveOptionSymbol({ underlying, expiry, strike, optionType, exchange })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 }

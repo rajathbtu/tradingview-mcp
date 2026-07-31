@@ -83,4 +83,11 @@ export function registerDataTools(server) {
     try { return jsonResult(await core.getStudyValues()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
+
+  server.tool('data_get_market_snapshot', 'Get a compact first-pass snapshot of chart state, quote, OHLCV summary, and study values in one call to reduce round-trips.', {
+    count: z.coerce.number().optional().describe('Number of bars to include in the OHLCV summary (default 20)'),
+  }, async ({ count }) => {
+    try { return jsonResult(await core.getMarketSnapshot({ count })); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
 }

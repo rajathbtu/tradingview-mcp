@@ -88,14 +88,33 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 
 These tools can return large payloads. Follow these rules to avoid context bloat:
 
+## Response Style Rules
+
+When the user asks for trade analysis, return a compact decision summary only.
+
+Required format:
+- Decision: BUY CE / BUY PE / NO TRADE
+- Option / Strike
+- Entry
+- Stop
+- Target 1
+- Target 2
+- Position Size / Capital
+- Expected Profit
+- Reason (1 line)
+
+Do not provide long narrative summaries, background stories, or repeated explanation. Keep it concise and token-efficient.
+
 1. **Always use `summary: true` on `data_get_ohlcv`** unless you specifically need individual bars
 2. **Always use `study_filter`** on pine tools when you know which indicator you want — don't scan all studies unnecessarily
+3. **Reuse fresh evidence within one analysis pass**: do not repeat quote/OHLCV/study-value requests for the same chart state unless the symbol, timeframe, or indicator set changed
 3. **Never use `verbose: true`** on pine tools unless the user specifically asks for raw drawing data with IDs/colors
 4. **Avoid calling `pine_get_source`** on complex scripts — it can return 200KB+. Only read if you need to edit the code.
 5. **Avoid calling `data_get_indicator`** on protected/encrypted indicators — their inputs are encoded blobs. Use `data_get_study_values` instead for current values.
 6. **Use `capture_screenshot`** for visual context instead of pulling large datasets — a screenshot is ~300KB but gives you the full visual picture
 7. **Call `chart_get_state` once** at the start to get entity IDs, then reference them — don't re-call repeatedly
 8. **Cap your OHLCV requests** — `count: 20` for quick analysis, `count: 100` for deeper work, `count: 500` only when specifically needed
+9. **Never guess NIFTY option symbols, expiries, ATM strikes, or option tickers.** Only use values that are directly verified from the live TradingView options-chain tab or a trusted external source the user explicitly provided. If the options-chain tab is not visibly available or the current symbol cannot be read from it, return VERIFY_DATA or NO_TRADE instead of improvising.
 
 ### Output Size Estimates (compact mode)
 | Tool | Typical Output |

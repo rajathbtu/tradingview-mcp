@@ -3,6 +3,55 @@
  */
 import { evaluate, evaluateAsync, getClient } from '../connection.js';
 
+export function buildPanelSelectors(panel) {
+  const normalized = String(panel || '').trim().toLowerCase();
+  if (normalized === 'options-chain' || normalized === 'options' || normalized === 'option-chain') {
+    return [
+      '[data-name="options"]',
+      '[data-name="options-chain"]',
+      '[data-name="options-chain-tab"]',
+      '[data-name*="option" i]',
+      '[data-name*="chain" i]',
+      '[aria-label*="options" i]',
+      '[aria-label*="option chain" i]',
+      '[aria-label*="chain" i]',
+      '[title*="options" i]',
+      '[title*="option chain" i]',
+      '[title*="chain" i]',
+    ];
+  }
+
+  const selectorMap = {
+    'watchlist': [
+      '[data-name="base-watchlist-widget-button"]',
+      '[data-name="base"]',
+      '[aria-label="Watchlist"]',
+      '[aria-label*="Watchlist, details, and news" i]',
+    ],
+    'alerts': [
+      '[data-name="alerts-button"]',
+      '[data-name="alerts"]',
+      '[aria-label="Alerts"]',
+    ],
+    'trading': [
+      '[data-name="trading-button"]',
+      '[aria-label="Trading Panel"]',
+      '[aria-label*="Trading" i]',
+    ],
+    'pine-editor': [
+      '[data-name="pine-editor"]',
+      '[aria-label*="pine" i]',
+    ],
+    'strategy-tester': [
+      '[data-name="backtesting"]',
+      '[aria-label*="strategy" i]',
+      '[aria-label*="backtesting" i]',
+    ],
+  };
+
+  return selectorMap[normalized] || [];
+}
+
 export async function click({ by, value }) {
   const escaped = JSON.stringify(value);
   const result = await evaluate(`
@@ -30,6 +79,40 @@ export async function click({ by, value }) {
 
 export async function openPanel({ panel, action }) {
   const isBottomPanel = panel === 'pine-editor' || panel === 'strategy-tester';
+
+  if (panel === 'options-chain' || panel === 'options' || panel === 'option-chain') {
+    const result = await evaluate(`
+      (function() {
+        var action = ${JSON.stringify(action)};
+        var candidates = ${JSON.stringify(buildPanelSelectors(panel))};
+        function findButton() {
+          for (var i = 0; i < candidates.length; i++) {
+            var el = document.querySelector(candidates[i]);
+            if (el) return el;
+          }
+          var all = Array.from(document.querySelectorAll('button, [role="tab"], [role="button"], a, [data-name]'));
+          for (var j = 0; j < all.length; j++) {
+            var text = (all[j].textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            var attrs = [all[j].getAttribute('data-name') || '', all[j].getAttribute('aria-label') || '', all[j].getAttribute('title') || ''].join(' ').toLowerCase();
+            if ((text.indexOf('option') !== -1 && text.indexOf('chain') !== -1) || (attrs.indexOf('option') !== -1 && attrs.indexOf('chain') !== -1) || (attrs.indexOf('options') !== -1)) return all[j];
+          }
+          return null;
+        }
+        var btn = findButton();
+        if (!btn) return { error: 'Options chain button not found.' };
+        var isOpen = !!(btn.getAttribute('aria-pressed') === 'true' || btn.classList.contains('isActive') || btn.classList.toString().indexOf('active') !== -1 || btn.classList.toString().indexOf('Active') !== -1);
+        var performed = 'none';
+        if (action === 'open' && !isOpen) { btn.click(); performed = 'opened'; }
+        else if (action === 'close' && isOpen) { btn.click(); performed = 'closed'; }
+        else if (action === 'toggle') { btn.click(); performed = isOpen ? 'closed' : 'opened'; }
+        else { performed = isOpen ? 'already_open' : 'already_closed'; }
+        return { was_open: isOpen, performed: performed, matched: (btn.getAttribute('data-name') || btn.getAttribute('aria-label') || btn.textContent || '').substring(0, 80) };
+      })()
+    `);
+    if (result && result.error) throw new Error(result.error);
+    return { success: true, panel, action, was_open: result?.was_open ?? false, performed: result?.performed ?? 'unknown', matched: result?.matched || null };
+  }
+
   if (isBottomPanel) {
     const widgetName = panel === 'pine-editor' ? 'pine-editor' : 'backtesting';
     const result = await evaluate(`

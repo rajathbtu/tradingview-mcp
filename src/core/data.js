@@ -3,6 +3,8 @@
  */
 import { evaluate, evaluateAsync, KNOWN_PATHS, safeString } from '../connection.js';
 import { waitForChartReady } from '../wait.js';
+import { analysisCache, makeCacheKey } from './cache.js';
+import { getState } from './chart.js';
 
 const MAX_OHLCV_BARS = 500;
 const MAX_TRADES = 20;
@@ -134,8 +136,22 @@ function buildGraphicsJS(collectionName, mapKey, filter) {
   `;
 }
 
+function compactScalar(value) {
+  if (typeof value === 'string') {
+    if (value.length > 140) return `${value.slice(0, 137)}...`;
+    return value;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.abs(value) >= 1000 ? Number(value.toFixed(2)) : Number(value.toFixed(6));
+  }
+  return value;
+}
+
 export async function getOhlcv({ count, summary } = {}) {
   const limit = Math.min(count || 100, MAX_OHLCV_BARS);
+  const cacheKey = makeCacheKey('ohlcv', { limit, summary: summary ? 'summary' : 'bars' });
+  const cached = analysisCache.get(cacheKey);
+  if (cached) return cached;
   let data;
   try {
     data = await evaluate(`
@@ -158,6 +174,7 @@ export async function getOhlcv({ count, summary } = {}) {
     throw new Error('Could not extract OHLCV data. The chart may still be loading.');
   }
 
+  let result;
   if (summary) {
     const bars = data.bars;
     const highs = bars.map(b => b.high);
@@ -165,7 +182,7 @@ export async function getOhlcv({ count, summary } = {}) {
     const volumes = bars.map(b => b.volume);
     const first = bars[0];
     const last = bars[bars.length - 1];
-    return {
+    result = {
       success: true, bar_count: bars.length,
       period: { from: first.time, to: last.time },
       open: first.open, close: last.close,
@@ -176,12 +193,19 @@ export async function getOhlcv({ count, summary } = {}) {
       avg_volume: Math.round(volumes.reduce((a, b) => a + b, 0) / volumes.length),
       last_5_bars: bars.slice(-5),
     };
+  } else {
+    result = { success: true, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, bars: data.bars };
   }
 
-  return { success: true, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, bars: data.bars };
+  analysisCache.set(cacheKey, result);
+  return result;
 }
 
 export async function getIndicator({ entity_id }) {
+  const cacheKey = makeCacheKey('indicator', { entity_id });
+  const cached = analysisCache.get(cacheKey);
+  if (cached) return cached;
+
   const data = await evaluate(`
     (function() {
       var api = ${CHART_API};
@@ -204,7 +228,31 @@ export async function getIndicator({ entity_id }) {
       return true;
     });
   }
-  return { success: true, entity_id, visible: data?.visible, inputs };
+  const result = { success: true, entity_id, visible: data?.visible, inputs };
+  analysisCache.set(cacheKey, result);
+  return result;
+}
+
+export async function getMarketSnapshot({ count = 20 } = {}) {
+  const [state, quote, ohlcv, studyValues] = await Promise.all([
+    getState(),
+    getQuote(),
+    getOhlcv({ count, summary: true }),
+    getStudyValues(),
+  ]);
+
+  return {
+    success: true,
+    chart: {
+      symbol: state?.symbol,
+      resolution: state?.resolution,
+      chartType: state?.chartType,
+      studies: state?.studies || [],
+    },
+    quote: quote?.success ? quote : null,
+    ohlcv: ohlcv?.success ? ohlcv : null,
+    study_values: studyValues?.success ? studyValues : null,
+  };
 }
 
 // #173: TradingView doesn't compute strategy report/orders until the Strategy
@@ -368,15 +416,19 @@ export async function getEquity() {
 }
 
 export async function getQuote({ symbol } = {}) {
+  const requested = (symbol || '').toString().trim();
+  const cacheKey = makeCacheKey('quote', { requested });
+  const cached = analysisCache.get(cacheKey);
+  if (cached) return cached;
+
   // Serialize: chained on _quoteLock so parallel callers run one after another.
   // Catch on the lock chain prevents a single failure from poisoning the chain.
-  const run = _quoteLock.then(() => _getQuoteInternal({ symbol }));
+  const run = _quoteLock.then(() => _getQuoteInternal({ symbol, requested, cacheKey }));
   _quoteLock = run.then(() => {}, () => {});
   return run;
 }
 
-async function _getQuoteInternal({ symbol } = {}) {
-  const requested = (symbol || '').toString().trim();
+async function _getQuoteInternal({ symbol, requested, cacheKey } = {}) {
   let originalSymbol = null;
   let needsRestore = false;
 
@@ -430,7 +482,9 @@ async function _getQuoteInternal({ symbol } = {}) {
       })()
     `);
     if (!data || (!data.last && !data.close)) throw new Error('Could not retrieve quote. The chart may still be loading.');
-    return { success: true, ...data };
+    const result = { success: true, ...data };
+    analysisCache.set(cacheKey, result);
+    return result;
   } finally {
     if (needsRestore && originalSymbol) {
       try {
@@ -494,6 +548,10 @@ export async function getDepth() {
 }
 
 export async function getStudyValues() {
+  const cacheKey = makeCacheKey('study-values', {});
+  const cached = analysisCache.get(cacheKey);
+  if (cached) return cached;
+
   const data = await evaluate(`
     (function() {
       var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
@@ -532,7 +590,17 @@ export async function getStudyValues() {
       return results;
     })()
   `);
-  return { success: true, study_count: data?.length || 0, studies: data || [] };
+  const studies = (data || []).map(study => {
+    const compacted = {};
+    for (const [key, value] of Object.entries(study.values || {})) {
+      if (value == null || value === '' || value === '∅') continue;
+      compacted[key] = compactScalar(value);
+    }
+    return { ...study, values: compacted };
+  });
+  const result = { success: true, study_count: studies.length, studies };
+  analysisCache.set(cacheKey, result);
+  return result;
 }
 
 export async function getPineLines({ study_filter, verbose } = {}) {

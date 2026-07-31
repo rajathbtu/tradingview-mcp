@@ -1,7 +1,10 @@
 import CDP from 'chrome-remote-interface';
+import http from 'node:http';
+import https from 'node:https';
 
 let client = null;
 let targetInfo = null;
+let targetContext = null;
 // Overridable via TV_CDP_HOST/TV_CDP_PORT (or CDP_HOST/CDP_PORT) env vars.
 // Default is 127.0.0.1, not localhost: on some Windows machines localhost
 // resolves to ::1 first, and Electron's --remote-debugging-port only listens on IPv4.
@@ -50,31 +53,38 @@ export function requireFinite(value, name) {
   return n;
 }
 
-export async function getClient() {
+export async function getClient(context = null) {
+  const normalizedContext = context || 'chart';
   if (client) {
     try {
       // Quick liveness check
       await client.Runtime.evaluate({ expression: '1', returnByValue: true });
-      return client;
+      if (targetContext === normalizedContext) {
+        return client;
+      }
     } catch {
-      client = null;
-      targetInfo = null;
+      // fall through to reconnect
     }
+    client = null;
+    targetInfo = null;
+    targetContext = null;
   }
-  return connect();
+  return connect(null, normalizedContext);
 }
 
-export async function connect(targetId = null) {
+export async function connect(targetId = null, context = null) {
+  const normalizedContext = context || 'chart';
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      const target = targetId ? await findTargetById(targetId) : await findChartTarget();
+      const target = targetId ? await findTargetById(targetId) : await findChartTarget(normalizedContext);
       if (!target) {
         throw new Error(targetId
           ? `CDP target ${targetId} not found — is the tab still open?`
           : 'No TradingView chart target found. Is TradingView open with a chart?');
       }
       targetInfo = target;
+      targetContext = normalizedContext;
       client = await CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id });
 
       // Enable required domains
@@ -92,6 +102,37 @@ export async function connect(targetId = null) {
   throw new Error(`CDP connection failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
 }
 
+async function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith('https:') ? https : http;
+    const req = client.get(url, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        if (res.statusCode && res.statusCode >= 400) {
+          reject(new Error(`HTTP ${res.statusCode}: ${body}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(3000, () => {
+      req.destroy(new Error('timeout'));
+    });
+  });
+}
+
+export async function listTargets() {
+  const targets = await fetchJson(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  return Array.isArray(targets) ? targets : [];
+}
+
 /**
  * Re-attach the cached CDP client to a specific target id.
  * Used by tab_switch so subsequent reads (chart_get_state, data_get_*,
@@ -103,22 +144,42 @@ export async function reconnectTo(targetId) {
     try { await client.close(); } catch { /* already gone */ }
     client = null;
     targetInfo = null;
+    targetContext = null;
   }
   return connect(targetId);
 }
 
-async function findChartTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
-  // Prefer targets with tradingview.com/chart in the URL
-  return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
-    || targets.find(t => t.type === 'page' && /tradingview/i.test(t.url))
+function isOptionsTarget(target) {
+  const url = String(target?.url || '');
+  const title = String(target?.title || '');
+  return /tradingview\.com\/options/i.test(url)
+    || /options chain/i.test(title)
+    || /options/i.test(title);
+}
+
+export function selectPageTarget(pageTargets, context = null) {
+  const targets = Array.isArray(pageTargets) ? pageTargets : [];
+  const normalizedContext = String(context || '').trim().toLowerCase();
+
+  if (normalizedContext === 'options' || normalizedContext === 'option-chain' || normalizedContext === 'options-chain') {
+    return targets.find(isOptionsTarget) || null;
+  }
+
+  return targets.find((t) => /tradingview\.com\/chart/i.test(t.url))
+    || targets.find(isOptionsTarget)
+    || targets.find((t) => /tradingview/i.test(t.url))
+    || targets[0]
     || null;
 }
 
+async function findChartTarget(context = null) {
+  const targets = await listTargets();
+  const pageTargets = targets.filter((t) => t.type === 'page');
+  return selectPageTarget(pageTargets, context);
+}
+
 async function findTargetById(id) {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+  const targets = await listTargets();
   return targets.find(t => t.id === id) || null;
 }
 
@@ -130,7 +191,7 @@ export async function getTargetInfo() {
 }
 
 export async function evaluate(expression, opts = {}) {
-  const c = await getClient();
+  const c = await getClient(opts.context ?? null);
   const result = await c.Runtime.evaluate({
     expression,
     returnByValue: true,
@@ -155,6 +216,7 @@ export async function disconnect() {
     try { await client.close(); } catch {}
     client = null;
     targetInfo = null;
+    targetContext = null;
   }
 }
 
