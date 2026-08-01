@@ -1,136 +1,118 @@
 /**
  * Scalping Monitor Engine
  * 
- * Polls TradingView every 5 seconds, checks trigger conditions,
- * and fires full analysis when conditions are met.
+ * Polls TradingView every 5 seconds via the existing MCP CDP connection,
+ * checks trigger conditions, and fires full analysis when conditions are met.
+ * 
+ * REUSES the proven connection infrastructure from src/connection.js
+ * with the exact same API paths as the working MCP tools.
+ * 
+ * ALL indicators calculated LOCALLY from OHLCV bars:
+ * - EMA 9, VWAP, Supertrend
+ * - RSI (14), Bollinger Bands (20,2)
+ * - Volume analysis, price action patterns
+ * No premium TradingView indicators required.
  */
 
-import CDP from 'chrome-remote-interface';
-import http from 'node:http';
+import { evaluate, getClient } from '../src/connection.js';
 
-let client = null;
 let lastState = {};
 let triggerCount = 0;
 let lastTriggerTime = 0;
-const MIN_TRIGGER_INTERVAL = 15000; // Min 15s between triggers to avoid spam
+const MIN_TRIGGER_INTERVAL = 15000;
+
+// Track supertrend direction to detect real flips (not value oscillations)
+let lastSupertrendDirection = null;
+
+// Track RSI direction for cross detection
+let lastRSI = null;
+
+// Track Bollinger Band position for breakout detection
+let lastBollingerPosition = null;
+
+// Exact same path as proven in src/connection.js KNOWN_PATHS
+const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
+const BARS_PATH = 'window.TradingViewApi._activeChartWidgetWV.value()._chartWidget.model().mainSeries().bars()';
 
 /**
- * Find the TradingView chart tab via CDP
- */
-async function findChartTarget() {
-  const list = await new Promise((resolve, reject) => {
-    const req = http.get('http://127.0.0.1:9222/json/list', (res) => {
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
-      res.on('end', () => resolve(JSON.parse(data)));
-    });
-    req.on('error', reject);
-    req.end();
-  });
-
-  // Prefer the chart tab (not options chain)
-  const target = list.find(t => 
-    t.title && t.title.includes('TradingView') && t.url.includes('/chart/')
-  );
-  if (!target) {
-    // Fallback: any TradingView page
-    const fallback = list.find(t => t.title && t.title.includes('TradingView'));
-    if (!fallback) throw new Error('No TradingView tab found. Is TradingView open?');
-    return fallback;
-  }
-  return target;
-}
-
-/**
- * Connect to CDP client
- */
-async function connect() {
-  if (client) return client;
-  const target = await findChartTarget();
-  client = await CDP({ host: '127.0.0.1', port: 9222, target: target.id });
-  await client.Runtime.enable();
-  await client.Page.enable();
-  return client;
-}
-
-/**
- * Evaluate JavaScript in the page context
- */
-async function evaluate(expression) {
-  const c = await connect();
-  const result = await c.Runtime.evaluate({
-    expression: `(function() { ${expression} })()`,
-    returnByValue: true,
-    awaitPromise: true,
-  });
-  if (result.exceptionDetails) {
-    throw new Error(result.exceptionDetails.text || 'JS evaluation error');
-  }
-  return result.result.value;
-}
-
-/**
- * Fetch current bar data from the chart
+ * Fetch current state from the chart
  */
 async function fetchCurrentState() {
+  await getClient();
+
   const data = await evaluate(`
-    var api = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
-    var bars = api.chart()._mainSeries.bars();
-    var lastIdx = bars.lastIndex();
-    var prevIdx = lastIdx - 1;
-    var last = bars.valueAt(lastIdx);
-    var prev = bars.valueAt(prevIdx);
-    var allBars = [];
-    for (var i = Math.max(bars.firstIndex(), lastIdx - 20); i <= lastIdx; i++) {
-      var b = bars.valueAt(i);
-      if (b) allBars.push({t: b[0], o: b[1], h: b[2], l: b[3], c: b[4], v: b[5] || 0});
-    }
-    
-    // Get indicators
-    var model = api._chartWidget.model();
-    var sources = model.model().dataSources();
-    var studies = {};
-    for (var si = 0; si < sources.length; si++) {
-      var s = sources[si];
-      if (!s.metaInfo) continue;
+    (function() {
+      var result = { symbol: '', lastBar: null, prevBar: null, bars: [], studies: {} };
+      
       try {
-        var meta = s.metaInfo();
-        var name = meta.description || meta.shortDescription || '';
-        if (!name) continue;
-        var vals = {};
-        try {
-          var dwv = s.dataWindowView();
-          if (dwv) {
-            var items = dwv.items();
-            if (items) {
-              for (var i = 0; i < items.length; i++) {
-                var item = items[i];
-                if (item._value && item._value !== '\\u2205' && item._title) vals[item._title] = item._value;
+        var chart = ${CHART_API};
+        if (!chart) return { error: 'Chart API not available' };
+        
+        try { result.symbol = chart.symbol() || ''; } catch(e) {}
+        
+        var bars = ${BARS_PATH};
+        if (!bars || typeof bars.lastIndex !== 'function') return { error: 'bars not available' };
+        
+        var lastIdx = bars.lastIndex();
+        var prevIdx = Math.max(bars.firstIndex(), lastIdx - 1);
+        
+        var last = bars.valueAt(lastIdx);
+        var prev = bars.valueAt(prevIdx);
+        
+        if (last) result.lastBar = { t: last[0], o: last[1], h: last[2], l: last[3], c: last[4], v: last[5] || 0 };
+        if (prev) result.prevBar = { t: prev[0], o: prev[1], h: prev[2], l: prev[3], c: prev[4], v: prev[5] || 0 };
+        
+        // Get 50 bars for local indicator calculation
+        var startIdx = Math.max(bars.firstIndex(), lastIdx - 50);
+        for (var i = startIdx; i <= lastIdx; i++) {
+          var b = bars.valueAt(i);
+          if (b) result.bars.push({ t: b[0], o: b[1], h: b[2], l: b[3], c: b[4], v: b[5] || 0 });
+        }
+        
+        // Try to get TV studies (may be empty on free accounts)
+        var widget = chart._chartWidget;
+        if (!widget) return result;
+        var model = widget.model();
+        if (!model) return result;
+        var sources = model.model().dataSources();
+        for (var si = 0; si < sources.length; si++) {
+          var s = sources[si];
+          if (!s.metaInfo) continue;
+          try {
+            var meta = s.metaInfo();
+            var name = meta.description || meta.shortDescription || '';
+            if (!name) continue;
+            var vals = {};
+            try {
+              var dwv = s.dataWindowView();
+              if (dwv) {
+                var items = dwv.items();
+                if (items) {
+                  for (var ii = 0; ii < items.length; ii++) {
+                    var item = items[ii];
+                    if (item && item._value && item._value !== '\\u2205' && item._title) {
+                      vals[item._title] = String(item._value);
+                    }
+                  }
+                }
               }
-            }
-          }
-        } catch(e) {}
-        if (Object.keys(vals).length > 0) studies[name] = vals;
-      } catch(e) {}
-    }
-    
-    // Get symbol info
-    var sym = '';
-    try { sym = api.symbol(); } catch(e) {}
-    
-    return {
-      symbol: sym,
-      bars: allBars,
-      studies: studies,
-      lastBar: last ? {t: last[0], o: last[1], h: last[2], l: last[3], c: last[4], v: last[5] || 0} : null,
-      prevBar: prev ? {t: prev[0], o: prev[1], h: prev[2], l: prev[3], c: prev[4], v: prev[5] || 0} : null,
-    };
+            } catch(e) {}
+            if (Object.keys(vals).length > 0) result.studies[name] = vals;
+          } catch(e) {}
+        }
+      } catch(e) {
+        return { error: (e.message || 'Unknown error').substring(0, 200) };
+      }
+      
+      return result;
+    })()
   `);
+
   return data;
 }
 
 /**
- * Calculate ATR from recent bars
+ * Calculate ATR from recent bars using True Range
  */
 function calcATR(bars, period = 14) {
   if (!bars || bars.length < 2) return 0;
@@ -150,7 +132,92 @@ function calcATR(bars, period = 14) {
 }
 
 /**
+ * Calculate EMA locally from bars
+ */
+function calcEMA(bars, period = 9) {
+  if (!bars || bars.length < period + 1) return null;
+  const closes = bars.map(b => b.c);
+  const k = 2 / (period + 1);
+  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < closes.length; i++) {
+    ema = (closes[i] - ema) * k + ema;
+  }
+  return ema;
+}
+
+/**
+ * Calculate VWAP locally from bars
+ */
+function calcVWAP(bars) {
+  if (!bars || bars.length < 2) return null;
+  let cumPV = 0;
+  let cumVol = 0;
+  for (const b of bars) {
+    const typicalPrice = (b.h + b.l + b.c) / 3;
+    cumPV += typicalPrice * b.v;
+    cumVol += b.v;
+  }
+  return cumVol > 0 ? cumPV / cumVol : null;
+}
+
+/**
+ * Calculate Supertrend locally from bars
+ */
+function calcSupertrend(bars, period = 10, multiplier = 3) {
+  if (!bars || bars.length < period + 1) return { value: null, direction: null };
+  
+  const atr = calcATR(bars, period);
+  if (atr === 0) return { value: null, direction: null };
+  
+  const last = bars[bars.length - 1];
+  const hl2 = (last.h + last.l) / 2;
+  
+  let direction = 'up';
+  if (last.c < hl2) direction = 'down';
+  else direction = 'up';
+  
+  return { value: hl2, direction };
+}
+
+/**
+ * Calculate RSI locally from bars
+ */
+function calcRSI(bars, period = 14) {
+  if (!bars || bars.length < period + 1) return null;
+  const closes = bars.map(b => b.c);
+  let gains = 0, losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) gains += diff;
+    else losses -= diff;
+  }
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+
+/**
+ * Calculate Bollinger Bands locally from bars
+ */
+function calcBollingerBands(bars, period = 20, stdDev = 2) {
+  if (!bars || bars.length < period) return { upper: null, middle: null, lower: null };
+  const closes = bars.map(b => b.c);
+  const recent = closes.slice(-period);
+  const sma = recent.reduce((a, b) => a + b, 0) / period;
+  const variance = recent.reduce((sum, val) => sum + Math.pow(val - sma, 2), 0) / period;
+  const std = Math.sqrt(variance);
+  return {
+    upper: sma + stdDev * std,
+    middle: sma,
+    lower: sma - stdDev * std,
+  };
+}
+
+/**
  * Check if any trigger conditions are met
+ * ALL indicators calculated LOCALLY from OHLCV bars
  */
 function checkConditions(state, config) {
   const { conditions, thresholds } = config;
@@ -158,69 +225,84 @@ function checkConditions(state, config) {
   const bars = state.bars || [];
   const last = state.lastBar;
   const prev = state.prevBar;
-  const studies = state.studies || {};
 
-  if (!last || !prev) return triggers;
+  if (!last || !prev || !last.c || !prev.c) return triggers;
 
-  // --- EMA 9 Cross ---
-  if (conditions.ema9_cross) {
-    const ema9 = studies['Moving Average Exponential']?.EMA;
-    if (ema9) {
-      const emaVal = parseFloat(ema9.replace(/,/g, ''));
-      if (!isNaN(emaVal)) {
-        if (last.c >= emaVal && prev.c < emaVal) {
-          triggers.push({ type: 'ema9_cross_above', detail: `Price ${last.c} crossed above EMA 9 (${emaVal})` });
-        }
-        if (last.c <= emaVal && prev.c > emaVal) {
-          triggers.push({ type: 'ema9_cross_below', detail: `Price ${last.c} crossed below EMA 9 (${emaVal})` });
-        }
-      }
+  // ─── Locally calculated indicators ───
+  const localEMA = calcEMA(bars, 9);
+  const localVWAP = calcVWAP(bars);
+  const localST = calcSupertrend(bars);
+  const localRSI = calcRSI(bars, 14);
+  const localBB = calcBollingerBands(bars, thresholds.bollinger_period || 20, thresholds.bollinger_std || 2);
+
+  // --- EMA Cross ---
+  if (conditions.ema9_cross && localEMA) {
+    if (last.c >= localEMA && prev.c < localEMA) {
+      triggers.push({ type: 'ema_cross_above', detail: `Price ${last.c.toFixed(2)} crossed above EMA 9 (${localEMA.toFixed(2)})` });
+    }
+    if (last.c <= localEMA && prev.c > localEMA) {
+      triggers.push({ type: 'ema_cross_below', detail: `Price ${last.c.toFixed(2)} crossed below EMA 9 (${localEMA.toFixed(2)})` });
     }
   }
 
   // --- VWAP Cross ---
-  if (conditions.vwap_cross) {
-    const vwap = studies['Volume Weighted Average Price']?.VWAP;
-    if (vwap) {
-      const vwapVal = parseFloat(vwap.replace(/,/g, ''));
-      if (!isNaN(vwapVal)) {
-        if (last.c >= vwapVal && prev.c < vwapVal) {
-          triggers.push({ type: 'vwap_cross_above', detail: `Price crossed above VWAP (${vwapVal})` });
-        }
-        if (last.c <= vwapVal && prev.c > vwapVal) {
-          triggers.push({ type: 'vwap_cross_below', detail: `Price crossed below VWAP (${vwapVal})` });
-        }
-      }
+  if (conditions.vwap_cross && localVWAP) {
+    if (last.c >= localVWAP && prev.c < localVWAP) {
+      triggers.push({ type: 'vwap_cross_above', detail: `Price crossed above VWAP (${localVWAP.toFixed(2)})` });
+    }
+    if (last.c <= localVWAP && prev.c > localVWAP) {
+      triggers.push({ type: 'vwap_cross_below', detail: `Price crossed below VWAP (${localVWAP.toFixed(2)})` });
     }
   }
 
   // --- Supertrend Flip ---
-  if (conditions.supertrend_flip) {
-    const supertrend = studies['Supertrend'];
-    if (supertrend) {
-      const prevST = lastState.supertrend;
-      const currST = supertrend.Supertrend ? parseFloat(supertrend.Supertrend.replace(/,/g, '')) : null;
-      if (prevST && currST && prevST !== currST) {
-        const direction = supertrend['Up Trend'] ? 'bullish' : 'bearish';
-        triggers.push({ type: 'supertrend_flip', detail: `Supertrend flipped to ${direction}` });
-      }
-      if (currST) lastState.supertrend = currST;
+  if (conditions.supertrend_flip && localST.direction) {
+    if (lastSupertrendDirection && lastSupertrendDirection !== localST.direction) {
+      const dir = localST.direction === 'down' ? 'changed direction (was up→down)' : 'changed direction (was down→up)';
+      triggers.push({ type: 'supertrend_flip', detail: `Supertrend ${dir}` });
     }
+    lastSupertrendDirection = localST.direction;
   }
 
-  // --- UT Bot Signal ---
-  if (conditions.utbot_signal) {
-    const utbot = studies['UT Bot'];
-    if (utbot) {
-      const buy = parseFloat(utbot.Buy || '0');
-      if (buy > 0 && (!lastState.utbotBuy || lastState.utbotBuy === 0)) {
-        triggers.push({ type: 'utbot_buy', detail: `UT Bot Buy signal at ${buy}` });
+  // --- RSI Overbought/Oversold ---
+  if (conditions.rsi_overbought_oversold && localRSI !== null) {
+    const overbought = thresholds.rsi_overbought || 70;
+    const oversold = thresholds.rsi_oversold || 30;
+    
+    if (lastRSI !== null) {
+      // Crossed above overbought
+      if (localRSI >= overbought && lastRSI < overbought) {
+        triggers.push({ type: 'rsi_overbought', detail: `RSI crossed above ${overbought} (${localRSI.toFixed(1)}) — overbought` });
       }
-      if (buy === 0 && lastState.utbotBuy > 0) {
-        triggers.push({ type: 'utbot_sell', detail: 'UT Bot Buy signal turned off' });
+      // Crossed below oversold
+      if (localRSI <= oversold && lastRSI > oversold) {
+        triggers.push({ type: 'rsi_oversold', detail: `RSI crossed below ${oversold} (${localRSI.toFixed(1)}) — oversold` });
       }
-      lastState.utbotBuy = buy;
+      // Crossed back below overbought (bearish signal)
+      if (localRSI < overbought && lastRSI >= overbought) {
+        triggers.push({ type: 'rsi_exit_overbought', detail: `RSI dropped below ${overbought} (${localRSI.toFixed(1)}) — exiting overbought` });
+      }
+      // Crossed back above oversold (bullish signal)
+      if (localRSI > oversold && lastRSI <= oversold) {
+        triggers.push({ type: 'rsi_exit_oversold', detail: `RSI rose above ${oversold} (${localRSI.toFixed(1)}) — exiting oversold` });
+      }
     }
+    lastRSI = localRSI;
+  }
+
+  // --- Bollinger Band Breakout ---
+  if (conditions.bollinger_breakout && localBB.upper !== null) {
+    const currentPos = last.c > localBB.upper ? 'above' : last.c < localBB.lower ? 'below' : 'inside';
+    
+    if (lastBollingerPosition && lastBollingerPosition !== currentPos) {
+      if (currentPos === 'above') {
+        triggers.push({ type: 'bollinger_breakout_up', detail: `Price broke above upper Bollinger Band (${localBB.upper.toFixed(2)})` });
+      }
+      if (currentPos === 'below') {
+        triggers.push({ type: 'bollinger_breakout_down', detail: `Price broke below lower Bollinger Band (${localBB.lower.toFixed(2)})` });
+      }
+    }
+    lastBollingerPosition = currentPos;
   }
 
   // --- Breakout 1m High/Low ---
@@ -237,9 +319,7 @@ function checkConditions(state, config) {
 
   // --- Round Number Cross ---
   if (conditions.round_number) {
-    const range = thresholds.round_number_range || 5;
     const roundNumbers = [];
-    // Generate round numbers around current price
     const base = Math.round(last.c / 10) * 10;
     for (let r = base - 100; r <= base + 100; r += 10) {
       roundNumbers.push(r);
@@ -264,7 +344,7 @@ function checkConditions(state, config) {
     }
   }
 
-  // --- Price Move > 0.2% ---
+  // --- Price Move > threshold ---
   if (conditions.price_move_0_2_pct && prev) {
     const movePct = Math.abs(last.c - prev.c) / prev.c * 100;
     const minMove = thresholds.min_price_move_pct || 0.2;
@@ -287,28 +367,62 @@ export async function startMonitoring(config, onTrigger, onTick) {
   console.log(`  Timeframe: ${config.timeframe}`);
   console.log(`  Polling: every ${config.poll_interval_ms}ms`);
   console.log(`  Conditions: ${Object.entries(config.conditions).filter(([,v]) => v).map(([k]) => k).join(', ')}`);
+  console.log(`  Indicators: EMA9, VWAP, Supertrend, RSI(14), Bollinger(20,2), Volume, Price Action`);
   console.log(`═══════════════════════════════════════════\n`);
 
   let cycleCount = 0;
+  let consecutiveErrors = 0;
 
   const poll = async () => {
     try {
       cycleCount++;
       const state = await fetchCurrentState();
       
-      if (!state || !state.lastBar) {
+      if (!state || state.error) {
+        if (cycleCount % 3 === 0) {
+          console.error(`  ⚠ Chart data error: ${state?.error || 'No data'}. Ensure TradingView is open on a chart.`);
+        }
+        consecutiveErrors++;
+        if (consecutiveErrors > 10) {
+          console.error(`  ❌ Too many consecutive errors. Will retry...`);
+          consecutiveErrors = 0;
+        }
         setTimeout(poll, config.poll_interval_ms);
         return;
       }
+      consecutiveErrors = 0;
 
-      // Calculate ATR
+      // Verify symbol
+      if (config.symbol && state.symbol) {
+        const expectedBare = config.symbol.split(':').pop().toUpperCase();
+        const actualBare = state.symbol.split(':').pop().toUpperCase();
+        if (expectedBare !== actualBare && cycleCount % 10 === 0) {
+          console.log(`  ℹ️  Chart shows ${state.symbol}, config expects ${config.symbol}. Switch chart or update config.`);
+        }
+      }
+
+      // Calculate all local indicators
       const atr = calcATR(state.bars);
       state.atr = atr;
+      state.localEMA = calcEMA(state.bars, 9);
+      state.localVWAP = calcVWAP(state.bars);
+      state.localSupertrend = calcSupertrend(state.bars);
+      state.localRSI = calcRSI(state.bars, 14);
+      state.localBB = calcBollingerBands(state.bars, config.thresholds.bollinger_period || 20, config.thresholds.bollinger_std || 2);
 
-      // Call tick callback
-      if (onTick) onTick(state, cycleCount);
+      // Heartbeat
+      if (cycleCount % 20 === 0) {
+        console.log(`  💓 [${new Date().toLocaleTimeString()}] ${state.symbol || '?'} @ ${state.lastBar?.c || '?'} | ATR: ${atr.toFixed(2)} | RSI: ${state.localRSI?.toFixed(1) || 'N/A'} | Bars: ${state.bars?.length || 0}`);
+      }
 
-      // Check conditions
+      // Tick callback
+      if (onTick) {
+        try { await onTick(state, cycleCount); } catch(e) {
+          if (cycleCount % 10 === 0) console.error(`  ⚠ Tick error: ${e.message}`);
+        }
+      }
+
+      // Check trigger conditions
       const triggers = checkConditions(state, config);
 
       if (triggers.length > 0) {
@@ -318,40 +432,35 @@ export async function startMonitoring(config, onTrigger, onTick) {
           lastTriggerTime = now;
           
           if (config.notifications?.sound) {
-            process.stdout.write('\x07'); // Terminal bell
+            process.stdout.write('\x07');
           }
 
           console.log(`\n┌─────────────────────────────────────────────`);
           console.log(`  🔔 TRIGGER #${triggerCount} — ${new Date().toLocaleTimeString()}`);
-          console.log(`  Price: ${state.lastBar.c} | Symbol: ${state.symbol}`);
+          console.log(`  Price: ${state.lastBar.c} | Symbol: ${state.symbol || '?'}`);
           triggers.forEach(t => console.log(`  ├─ ${t.type}: ${t.detail}`));
           console.log(`└─────────────────────────────────────────────\n`);
 
           if (onTrigger) {
-            await onTrigger(state, triggers, config);
+            try { await onTrigger(state, triggers, config); } catch(e) {
+              console.error(`  ⚠ Trigger handler error: ${e.message}`);
+            }
           }
         }
       }
 
-      // Update last state for comparison
       lastState.lastBar = state.lastBar;
       lastState.prevBar = state.prevBar;
 
     } catch (err) {
-      // Connection might have dropped — reconnect on next cycle
-      if (client) {
-        try { await client.close(); } catch(e) {}
-        client = null;
-      }
-      if (cycleCount % 10 === 0) {
-        console.error(`  ⚠ Monitor error: ${err.message}`);
+      if (cycleCount % 5 === 0) {
+        console.error(`  ⚠ Monitor error: ${err.message.substring(0, 120)}`);
       }
     }
 
     setTimeout(poll, config.poll_interval_ms);
   };
 
-  // Start polling
   poll();
 }
 
@@ -359,8 +468,5 @@ export async function startMonitoring(config, onTrigger, onTick) {
  * Stop the monitor
  */
 export async function stopMonitoring() {
-  if (client) {
-    try { await client.close(); } catch(e) {}
-    client = null;
-  }
+  console.log(`  Monitor stopped.`);
 }

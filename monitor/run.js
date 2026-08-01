@@ -7,12 +7,16 @@
  * 
  * Monitors the TradingView chart in real-time, triggers on conditions,
  * runs full analysis, asks for trade confirmation, and tracks positions.
+ * 
+ * Positions NEVER auto-exit — user must confirm all exits.
+ * Real-time dashboard updates every tick during active positions.
  */
 
 import { createInterface } from 'node:readline';
 import { startMonitoring, stopMonitoring } from './engine.js';
 import { analyze, formatAnalysis } from './analyzer.js';
-import { enterTrade, updatePosition, getPosition, hasActivePosition, formatPositionStatus, onExit } from './tracker.js';
+import { enterTrade, updatePosition, confirmExit, getPosition, hasActivePosition, formatPositionStatus, onExit } from './tracker.js';
+import { recordTradeOutcome, getLearningStats } from './analyzer.js';
 import config from './config.js';
 
 // Readline interface for user input
@@ -26,6 +30,9 @@ let lastAnalysis = null;
 let lastExit = null;
 let exitHistory = [];
 let tickCount = 0;
+let pendingExitSignal = null;
+let lastExitPromptTime = 0;
+const EXIT_PROMPT_COOLDOWN = 10000; // Don't re-prompt for same exit within 10s
 
 /**
  * Ask user for trade confirmation
@@ -56,8 +63,15 @@ function askTradeConfirmation(analysis) {
 
 /**
  * Handle trigger event — run analysis and ask for trade
+ * SKIPS if already in an active position to prevent auto-closing
  */
 async function onTrigger(state, triggers, cfg) {
+  // NEVER enter a new trade if already in one
+  if (hasActivePosition()) {
+    console.log(`  ⏸️  Already in a position. Ignoring new trigger signals.\n`);
+    return;
+  }
+
   console.log(`  ⏳ Running analysis...`);
 
   const analysis = await analyze(state, triggers, cfg);
@@ -81,36 +95,58 @@ async function onTrigger(state, triggers, cfg) {
 }
 
 /**
- * Handle tick event — update position tracking
+ * Handle tick event — update position tracking and show real-time dashboard
  */
 async function onTick(state, cycleCount) {
   tickCount = cycleCount;
 
-  // Show status every 10 cycles
-  if (cycleCount % 10 === 0) {
-    const pos = getPosition();
-    if (pos) {
-      // Create a lightweight state for the tracker
-      const trackerState = {
-        momentum: lastAnalysis?.momentum || { score: 0 },
-        recommendation: lastAnalysis?.recommendation || null,
-      };
+  const pos = getPosition();
+  if (!pos) return;
 
-      const exit = updatePosition(state.lastBar.c, trackerState, config);
-      if (exit) {
-        lastExit = exit;
-        exitHistory.push(exit);
-        console.log(`  📊 Trade closed: ${exit.pnl_pct.toFixed(2)}% in ${((exit.exit_time - exit.entry_time) / 1000).toFixed(0)}s`);
+  // Run fresh analysis on every tick when a position is active
+  let currentAnalysis = null;
+  try {
+    currentAnalysis = await analyze(state, [], config);
+    lastAnalysis = currentAnalysis;
+  } catch(e) {
+    currentAnalysis = lastAnalysis;
+  }
 
-        // Continue monitoring after exit
-        console.log(`  🔍 Resuming monitor...\n`);
-      } else {
-        const pos = getPosition();
-        if (pos) {
-          console.log(formatPositionStatus(pos));
-        }
-      }
+  const trackerState = {
+    momentum: currentAnalysis?.momentum || { score: 0 },
+    recommendation: currentAnalysis?.recommendation || null,
+  };
+
+  // Check for exit signals (does NOT auto-exit)
+  const exitSignal = updatePosition(state.lastBar.c, trackerState, config);
+
+  // ─── Show real-time dashboard every tick ───
+  console.log(formatPositionStatus(pos, currentAnalysis));
+
+  // ─── Handle exit signals (non-blocking) ───
+  if (exitSignal) {
+    const now = Date.now();
+    const isNewSignal = !pendingExitSignal || 
+      pendingExitSignal.reason !== exitSignal.reason || 
+      (now - lastExitPromptTime) > EXIT_PROMPT_COOLDOWN;
+
+    if (isNewSignal) {
+      pendingExitSignal = exitSignal;
+      lastExitPromptTime = now;
+
+      console.log(`\n╔══════════════════════════════════════════════════╗`);
+      console.log(`║  🚨 EXIT SIGNAL                                 ║`);
+      console.log(`╚══════════════════════════════════════════════════╝`);
+      console.log(`  Reason:     ${exitSignal.reason}`);
+      console.log(`  Message:    ${exitSignal.message}`);
+      console.log(`  Price:      ${exitSignal.price?.toFixed(2) || exitSignal.price}`);
+      console.log(`  P&L:        ${pos.pnl >= 0 ? '✅' : '❌'} ${pos.pnl.toFixed(2)} (${pos.pnl_pct.toFixed(2)}%)`);
+      console.log(`──────────────────────────────────────────────────`);
+      console.log(`  Type 'exit' and press Enter to close the trade.`);
+      console.log(`  Type 'hold' to stay and continue monitoring.\n`);
     }
+  } else {
+    pendingExitSignal = null;
   }
 }
 
@@ -134,8 +170,45 @@ async function main() {
   console.log(`     Timeframe:  ${config.timeframe}`);
   console.log(`     Poll rate:  ${config.poll_interval_ms}ms`);
   console.log(`     Conditions: ${Object.entries(config.conditions).filter(([,v]) => v).length} active`);
-  console.log(`     Exit:       Trailing=${config.exit.trailing_stop}, MaxHold=${config.exit.max_hold_seconds}s`);
+  console.log(`     Exit:       Manual confirmation required, Trailing=${config.exit.trailing_stop}, MaxHold=${config.exit.max_hold_seconds}s`);
   console.log(`\n  Press Ctrl+C at any time to stop.\n`);
+
+  // Set up non-blocking stdin listener for exit commands during active positions
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    const input = chunk.toString().trim().toLowerCase();
+    
+    if (input === 'exit' || input === 'e') {
+      const pos = getPosition();
+      if (pos && pendingExitSignal) {
+        const result = confirmExit(pendingExitSignal.price, pendingExitSignal.reason, {});
+        if (result) {
+          lastExit = result;
+          exitHistory.push(result);
+          recordTradeOutcome(result);
+          console.log(`\n  📊 Trade closed: ${result.pnl_pct.toFixed(2)}% in ${((result.exit_time - result.entry_time) / 1000).toFixed(0)}s`);
+          console.log(`  🔍 Resuming monitor...\n`);
+          pendingExitSignal = null;
+        }
+      } else if (pos && !pendingExitSignal) {
+        // Force exit at current price even without signal
+        const currentPrice = pos.current_price || pos.entry;
+        const result = confirmExit(currentPrice, 'manual_exit', {});
+        if (result) {
+          lastExit = result;
+          exitHistory.push(result);
+          recordTradeOutcome(result);
+          console.log(`\n  📊 Trade closed: ${result.pnl_pct.toFixed(2)}% in ${((result.exit_time - result.entry_time) / 1000).toFixed(0)}s`);
+          console.log(`  🔍 Resuming monitor...\n`);
+        }
+      }
+    } else if (input === 'hold' || input === 'h') {
+      if (pendingExitSignal) {
+        console.log(`  ⏭️  Staying in position. Continuing monitoring...\n`);
+        pendingExitSignal = null;
+      }
+    }
+  });
 
   // Start the monitor
   await startMonitoring(config, onTrigger, onTick);

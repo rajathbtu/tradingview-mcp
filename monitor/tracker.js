@@ -4,10 +4,12 @@
  * After a trade is entered, monitors the position in real-time
  * and provides exit signals based on targets, stop loss, trailing stop,
  * time limits, and reversal conditions.
+ * 
+ * NEVER auto-exits — always returns exit signals for user confirmation.
  */
 
 let position = null;
-let trailingStop = null;
+let trailingStopPrice = null;
 let highestPrice = null;
 let lowestPrice = null;
 let entryTime = null;
@@ -34,6 +36,7 @@ export function enterTrade(analysis) {
     status: 'active',
     pnl: 0,
     pnl_pct: 0,
+    current_price: rec.entry,
     highest_price: rec.entry,
     lowest_price: rec.entry,
     trailing_stop: null,
@@ -46,7 +49,7 @@ export function enterTrade(analysis) {
   entryTime = Date.now();
   highestPrice = rec.entry;
   lowestPrice = rec.entry;
-  trailingStop = null;
+  trailingStopPrice = null;
 
   console.log(`\n╔══════════════════════════════════════════════════╗`);
   console.log(`║  🎯 TRADE ENTERED                               ║`);
@@ -64,7 +67,9 @@ export function enterTrade(analysis) {
 }
 
 /**
- * Update position with current price and check exit conditions
+ * Update position with current price and check exit conditions.
+ * Returns an exit signal object if an exit condition is met, but does NOT auto-exit.
+ * The caller must call confirmExit() to actually close the trade.
  */
 export function updatePosition(currentPrice, state, config) {
   if (!position || position.status !== 'active') return null;
@@ -95,84 +100,84 @@ export function updatePosition(currentPrice, state, config) {
   position.highest_price = highestPrice;
   position.lowest_price = lowestPrice;
 
-  // ─── Check Exit Conditions ───
+  // ─── Check Exit Conditions (return signal, do NOT auto-exit) ───
 
   // 1. Stop Loss hit
   if (position.direction === 'BUY' && currentPrice <= position.stop_loss) {
-    return exitTrade(currentPrice, 'stop_loss', state);
+    return { reason: 'stop_loss', price: currentPrice, message: `Stop loss hit at ${currentPrice}` };
   }
   if (position.direction === 'SELL' && currentPrice >= position.stop_loss) {
-    return exitTrade(currentPrice, 'stop_loss', state);
+    return { reason: 'stop_loss', price: currentPrice, message: `Stop loss hit at ${currentPrice}` };
   }
 
   // 2. Target 2 hit
   if (position.direction === 'BUY' && currentPrice >= position.target2) {
-    return exitTrade(currentPrice, 'target2', state);
+    return { reason: 'target2', price: currentPrice, message: `Target 2 reached at ${currentPrice}` };
   }
   if (position.direction === 'SELL' && currentPrice <= position.target2) {
-    return exitTrade(currentPrice, 'target2', state);
+    return { reason: 'target2', price: currentPrice, message: `Target 2 reached at ${currentPrice}` };
   }
 
-  // 3. Target 1 hit (partial or full)
+  // 3. Target 1 hit — signal if momentum fades
   if (position.direction === 'BUY' && currentPrice >= position.target1) {
-    // Could exit partial here, but for scalping we exit full at T1 if momentum fades
     if (state.momentum?.score < 0) {
-      return exitTrade(currentPrice, 'target1_no_momentum', state);
+      return { reason: 'target1_no_momentum', price: currentPrice, message: `Target 1 reached at ${currentPrice} but momentum fading` };
     }
   }
   if (position.direction === 'SELL' && currentPrice <= position.target1) {
     if (state.momentum?.score > 0) {
-      return exitTrade(currentPrice, 'target1_no_momentum', state);
+      return { reason: 'target1_no_momentum', price: currentPrice, message: `Target 1 reached at ${currentPrice} but momentum fading` };
     }
   }
 
-  // 4. Trailing Stop
+  // 4. Trailing Stop (percentage-based)
   if (exitConfig.trailing_stop) {
-    const atr = position.atr || 1;
-    const activationDist = exitConfig.trailing_activation * atr;
-    const trailDist = exitConfig.trailing_distance * atr;
+    const activationPct = (exitConfig.trailing_activation_pct || 0.3) / 100;
+    const trailPct = (exitConfig.trailing_distance_pct || 0.15) / 100;
 
-    if (!trailingStop) {
-      // Check if profit is enough to activate trailing
-      if (position.pnl >= activationDist) {
-        trailingStop = true;
+    if (!trailingStopPrice) {
+      // Check if profit % is enough to activate trailing
+      const pnlPct = Math.abs(position.pnl_pct) / 100;
+      if (pnlPct >= activationPct) {
         if (position.direction === 'BUY') {
-          trailingStop = currentPrice - trailDist;
+          trailingStopPrice = currentPrice * (1 - trailPct);
         } else {
-          trailingStop = currentPrice + trailDist;
+          trailingStopPrice = currentPrice * (1 + trailPct);
         }
+        position.trailing_activated = true;
       }
     } else {
       // Update trailing stop
       if (position.direction === 'BUY') {
-        const newStop = currentPrice - trailDist;
-        if (newStop > trailingStop) trailingStop = newStop;
-        if (currentPrice <= trailingStop) {
-          return exitTrade(currentPrice, 'trailing_stop', state);
+        const newStop = currentPrice * (1 - trailPct);
+        if (newStop > trailingStopPrice) trailingStopPrice = newStop;
+        if (currentPrice <= trailingStopPrice) {
+          return { reason: 'trailing_stop', price: currentPrice, message: `Trailing stop hit at ${currentPrice}` };
         }
       } else {
-        const newStop = currentPrice + trailDist;
-        if (newStop < trailingStop) trailingStop = newStop;
-        if (currentPrice >= trailingStop) {
-          return exitTrade(currentPrice, 'trailing_stop', state);
+        const newStop = currentPrice * (1 + trailPct);
+        if (newStop < trailingStopPrice) trailingStopPrice = newStop;
+        if (currentPrice >= trailingStopPrice) {
+          return { reason: 'trailing_stop', price: currentPrice, message: `Trailing stop hit at ${currentPrice}` };
         }
       }
     }
+    position.trailing_stop = trailingStopPrice;
   }
 
   // 5. Time-based exit
   if (elapsed >= exitConfig.max_hold_seconds) {
-    return exitTrade(currentPrice, 'time_limit', state);
+    return { reason: 'time_limit', price: currentPrice, message: `Max hold time (${exitConfig.max_hold_seconds}s) reached` };
   }
 
   // 6. Reversal exit
   if (exitConfig.exit_on_reversal && state.recommendation) {
     const rec = state.recommendation;
     if (position.direction === 'BUY' && rec.action === 'SELL') {
-      return exitTrade(currentPrice, 'reversal', state);
+      return { reason: 'reversal', price: currentPrice, message: `Reversal signal: recommendation changed to SELL` };
     }
     if (position.direction === 'SELL' && rec.action === 'BUY') {
-      return exitTrade(currentPrice, 'reversal', state);
+      return { reason: 'reversal', price: currentPrice, message: `Reversal signal: recommendation changed to BUY` };
     }
   }
 
@@ -180,9 +185,10 @@ export function updatePosition(currentPrice, state, config) {
 }
 
 /**
- * Exit the trade
+ * Confirm exit — actually closes the trade.
+ * Called when user approves an exit signal.
  */
-function exitTrade(exitPrice, reason, state) {
+export function confirmExit(exitPrice, reason, state) {
   if (!position || position.status !== 'active') return null;
 
   position.status = 'exited';
@@ -218,7 +224,7 @@ function exitTrade(exitPrice, reason, state) {
 
   const result = { ...position };
   position = null;
-  trailingStop = null;
+  trailingStopPrice = null;
   highestPrice = null;
   lowestPrice = null;
   entryTime = null;
@@ -248,22 +254,65 @@ export function onExit(callback) {
 }
 
 /**
- * Format position status for display
+ * Format position status for display — rich real-time dashboard
  */
-export function formatPositionStatus(pos) {
+export function formatPositionStatus(pos, analysis) {
   if (!pos) return 'No active position.';
 
   const elapsed = ((Date.now() - pos.entry_time) / 1000).toFixed(0);
   const pnlEmoji = pos.pnl >= 0 ? '✅' : '❌';
   const directionEmoji = pos.direction === 'BUY' ? '🟢' : '🔴';
+  const rec = analysis?.recommendation;
 
-  let output = `\n  ${directionEmoji} ACTIVE: ${pos.symbol} ${pos.direction} @ ${pos.entry}\n`;
-  output += `  Current: ${pos.current_price || '?'} | P&L: ${pnlEmoji} ${pos.pnl.toFixed(2)} (${pos.pnl_pct.toFixed(2)}%)\n`;
-  output += `  SL: ${pos.stop_loss} | T1: ${pos.target1} | T2: ${pos.target2}\n`;
-  output += `  Duration: ${elapsed}s`;
+  let output = `\n╔══════════════════════════════════════════════════╗\n`;
+  output += `║  ${directionEmoji} ACTIVE POSITION MONITOR                        ║\n`;
+  output += `╚══════════════════════════════════════════════════╝\n`;
+  output += `  Symbol:     ${pos.symbol}\n`;
+  output += `  Direction:  ${pos.direction === 'BUY' ? '🟢 LONG' : '🔴 SHORT'}\n`;
+  output += `  Entry:      ${pos.entry}\n`;
+  output += `  Current:    ${pos.current_price?.toFixed(2) || '?'}\n`;
+  output += `  P&L:        ${pnlEmoji} ${pos.pnl.toFixed(2)} (${pos.pnl_pct.toFixed(2)}%)\n`;
+  output += `  Duration:   ${elapsed}s\n`;
+  output += `\n`;
 
-  if (trailingStop) {
-    output += ` | Trail: ${typeof trailingStop === 'number' ? trailingStop.toFixed(2) : 'active'}`;
+  // Targets
+  output += `  ─── Levels ───\n`;
+  output += `  Stop Loss:  ${pos.stop_loss?.toFixed(2) || 'N/A'}\n`;
+  output += `  Target 1:   ${pos.target1?.toFixed(2) || 'N/A'}\n`;
+  output += `  Target 2:   ${pos.target2?.toFixed(2) || 'N/A'}\n`;
+  if (trailingStopPrice) {
+    output += `  Trail Stop: ${trailingStopPrice.toFixed(2)}\n`;
+  }
+  output += `\n`;
+
+  // Real-time analysis
+  if (analysis) {
+    output += `  ─── Real-Time Analysis ───\n`;
+    output += `  Trend:      ${analysis.trend?.direction || 'N/A'} (${analysis.trend?.score || 0})\n`;
+    output += `  Momentum:   ${analysis.momentum?.direction || 'N/A'} (${analysis.momentum?.score || 0})\n`;
+    output += `  Structure:  ${analysis.structure?.direction || 'N/A'} (${analysis.structure?.score || 0})\n`;
+    output += `  Confidence: ${rec?.confidence || 0}%\n`;
+    output += `\n`;
+
+    if (rec && rec.action !== 'NO TRADE') {
+      const arrow = rec.direction === 'BUY' ? '🟢' : '🔴';
+      output += `  ${arrow} RECOMMENDATION: ${rec.action}\n`;
+      output += `     Entry:      ${rec.entry}\n`;
+      output += `     Stop Loss:  ${rec.stop_loss}\n`;
+      output += `     Target 1:   ${rec.target1}\n`;
+      output += `     Target 2:   ${rec.target2}\n`;
+      output += `     Risk:Reward: 1:${rec.risk_reward}\n`;
+      output += `     Confidence: ${rec.confidence}%\n`;
+    } else {
+      output += `  ⏸️  Recommendation: HOLD / NO TRADE\n`;
+      // Bias interpretation depends on position direction
+      if (pos.direction === 'BUY') {
+        output += `     ${rec?.total_score > 0 ? 'Bullish bias ✅ — favorable for LONG' : rec?.total_score < 0 ? 'Bearish bias ⚠️ — consider exit' : 'No clear direction'}\n`;
+      } else {
+        // SHORT position: bearish bias is favorable, bullish bias is warning
+        output += `     ${rec?.total_score < 0 ? 'Bearish bias ✅ — favorable for SHORT' : rec?.total_score > 0 ? 'Bullish bias ⚠️ — consider exit' : 'No clear direction'}\n`;
+      }
+    }
   }
 
   return output;
