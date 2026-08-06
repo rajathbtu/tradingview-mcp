@@ -100,12 +100,16 @@ function generateAdvice(winRate, lossPatterns) {
   return 'Performance is acceptable. Continue monitoring.';
 }
 
+// Signal persistence: track direction over last N polls to avoid flip-flop
+let directionHistory = [];
+
 /**
  * Analyze the current chart state and generate a trade recommendation
- * Uses locally calculated indicators only
+ * Uses locally calculated indicators + multi-timeframe (5m) trend confirmation
+ * Requires signal persistence across multiple polls before recommending
  */
 export async function analyze(state, triggers, config) {
-  const { lastBar, prevBar, bars, symbol, atr, localEMA, localVWAP, localSupertrend, localRSI, localBB } = state;
+  const { lastBar, prevBar, bars, symbol, atr, localEMA, localVWAP, localSupertrend, localRSI, localBB, mtfTrend, context } = state;
   if (!lastBar) return null;
 
   const analysis = {
@@ -266,9 +270,63 @@ export async function analyze(state, triggers, config) {
     score: structureScore,
   };
 
-  // ─── Generate Recommendation (Cross-Verified) ───
-  const totalScore = trendScore + momentumScore + structureScore;
-  const maxScore = 9 + 6 + 4;
+  // ─── Multi-Timeframe Validation ───
+  // 5m trend must agree with the 1m trade direction
+  const mtfValid = mtfTrend && mtfTrend.direction !== 'neutral';
+  const mtfBullish = mtfTrend?.direction === 'bullish';
+  const mtfBearish = mtfTrend?.direction === 'bearish';
+
+  // ─── Context Enrichment (Phase 1) ───
+  // Market regime, volatility, and OpenBB context adjust confidence
+  const marketRegime = context?.market_regime || null;
+  const volatility = context?.volatility || null;
+  const openbb = context?.openbb || null;
+  const kronos = context?.kronos || null;
+
+  // Regime alignment: trending regime = higher confidence
+  let regimeBonus = 0;
+  if (marketRegime) {
+    if (marketRegime.regime === 'trending_up' && trendDirection === 'bullish') regimeBonus += 2;
+    else if (marketRegime.regime === 'trending_down' && trendDirection === 'bearish') regimeBonus += 2;
+    else if (marketRegime.regime === 'ranging') regimeBonus -= 1; // Ranging = harder to trade
+    else if (marketRegime.regime === 'volatile') regimeBonus -= 1; // Volatile = more risk
+  }
+
+  // Volatility adjustment: high vol = wider targets, lower confidence
+  let volAdjustment = 0;
+  if (volatility) {
+    if (volatility.vol_regime === 'high') volAdjustment -= 1;
+    else if (volatility.vol_regime === 'low') volAdjustment += 1;
+  }
+
+  // OpenBB sentiment: positive sentiment + bullish = bonus
+  let sentimentBonus = 0;
+  if (openbb?.available && openbb.sentiment) {
+    const sentScore = openbb.sentiment.score || 0;
+    if (sentScore > 0.3 && trendDirection === 'bullish') sentimentBonus += 1;
+    else if (sentScore < -0.3 && trendDirection === 'bearish') sentimentBonus += 1;
+  }
+
+  // Kronos AI forecast: AI direction + trend = bonus
+  let kronosBonus = 0;
+  if (kronos?.available && kronos.summary) {
+    const aiDir = kronos.summary.direction;
+    if (aiDir === 'up' && trendDirection === 'bullish') kronosBonus += 1;
+    else if (aiDir === 'down' && trendDirection === 'bearish') kronosBonus += 1;
+  }
+
+  // ─── Signal Persistence ───
+  // Track direction over last N polls to avoid flip-flop
+  const currentDirection = trendScore > 0 ? 'bullish' : trendScore < 0 ? 'bearish' : 'neutral';
+  directionHistory.push(currentDirection);
+  if (directionHistory.length > 3) directionHistory.shift();
+
+  const persistentBullish = directionHistory.filter(d => d === 'bullish').length >= 3;
+  const persistentBearish = directionHistory.filter(d => d === 'bearish').length >= 3;
+
+  // ─── Generate Recommendation (Cross-Verified + Multi-TF + Persistent + Context) ───
+  const totalScore = trendScore + momentumScore + structureScore + regimeBonus + volAdjustment + sentimentBonus + kronosBonus;
+  const maxScore = 9 + 6 + 4 + 2 + 1 + 1 + 1;
   const confidence = Math.round(Math.abs(totalScore) / maxScore * 100);
 
   // Cross-verification: count how many indicators agree on direction
@@ -303,19 +361,28 @@ export async function analyze(state, triggers, config) {
   const structureBullish = structureDirection === 'bullish';
   const structureBearish = structureDirection === 'bearish';
 
-  // BUY conditions: bullish trend + bullish momentum + bullish structure + enough signals
+  // BUY conditions:
+  // 1. 1m indicators bullish
+  // 2. 5m trend bullish (multi-timeframe confirmation)
+  // 3. Direction persisted for 3+ consecutive polls (no flip-flop)
+  // 4. Enough confirming signals
+  // 5. Confidence above threshold
   const buyConditions = 
     (!requireTrend || trendBullish) &&
     (!requireMomentum || momentumBullish) &&
     structureBullish &&
+    (!mtfValid || mtfBullish) &&       // 5m must agree if available
+    persistentBullish &&                // Must persist for 3+ polls
     confirmingSignals >= minConfirming &&
     confidence >= minConfidence;
 
-  // SELL conditions: bearish trend + bearish momentum + bearish structure + enough signals
+  // SELL conditions:
   const sellConditions = 
     (!requireTrend || trendBearish) &&
     (!requireMomentum || momentumBearish) &&
     structureBearish &&
+    (!mtfValid || mtfBearish) &&        // 5m must agree if available
+    persistentBearish &&                 // Must persist for 3+ polls
     (totalSignals - confirmingSignals) >= minConfirming &&
     confidence >= minConfidence;
 
@@ -329,40 +396,43 @@ export async function analyze(state, triggers, config) {
   if (buyConditions) {
     direction = 'BUY';
     
-    const target1Pct = (config.exit.target1_pct || 3.0) / 100;
-    const target2Pct = (config.exit.target2_pct || 5.0) / 100;
-    const stopLossPct = (config.exit.stop_loss_pct || 1.5) / 100;
+    // ATR-based targets (points, not %)
+    const atr = analysis.atr || 1;
+    const t1Mult = config.exit.target1_multiplier || 0.5;
+    const t2Mult = config.exit.target2_multiplier || 1.0;
+    const slMult = config.exit.stop_loss_multiplier || 0.3;
 
     entry = lastBar.c;
-    stopLoss = entry * (1 - stopLossPct);
-    target1 = entry * (1 + target1Pct);
-    target2 = entry * (1 + target2Pct);
+    stopLoss = entry - (atr * slMult);
+    target1 = entry + (atr * t1Mult);
+    target2 = entry + (atr * t2Mult);
     action = direction;
   } else if (sellConditions) {
     direction = 'SELL';
     
-    const target1Pct = (config.exit.target1_pct || 3.0) / 100;
-    const target2Pct = (config.exit.target2_pct || 5.0) / 100;
-    const stopLossPct = (config.exit.stop_loss_pct || 1.5) / 100;
+    const atr = analysis.atr || 1;
+    const t1Mult = config.exit.target1_multiplier || 0.5;
+    const t2Mult = config.exit.target2_multiplier || 1.0;
+    const slMult = config.exit.stop_loss_multiplier || 0.3;
 
     entry = lastBar.c;
-    stopLoss = entry * (1 + stopLossPct);
-    target1 = entry * (1 - target1Pct);
-    target2 = entry * (1 - target2Pct);
+    stopLoss = entry + (atr * slMult);
+    target1 = entry - (atr * t1Mult);
+    target2 = entry - (atr * t2Mult);
     action = direction;
   }
 
   const rr = stopLoss && entry ? Math.abs((target2 - entry) / (stopLoss - entry)) : 0;
 
-  // Calculate potential profit/loss percentages
-  let potentialProfitPct = null;
-  let potentialLossPct = null;
+  // Calculate potential profit/loss in points
+  let potentialProfitPts = null;
+  let potentialLossPts = null;
   if (direction === 'BUY' && target2 && stopLoss) {
-    potentialProfitPct = ((target2 - entry) / entry * 100).toFixed(2);
-    potentialLossPct = ((entry - stopLoss) / entry * 100).toFixed(2);
+    potentialProfitPts = (target2 - entry).toFixed(1);
+    potentialLossPts = (entry - stopLoss).toFixed(1);
   } else if (direction === 'SELL' && target2 && stopLoss) {
-    potentialProfitPct = ((entry - target2) / entry * 100).toFixed(2);
-    potentialLossPct = ((stopLoss - entry) / entry * 100).toFixed(2);
+    potentialProfitPts = (entry - target2).toFixed(1);
+    potentialLossPts = (stopLoss - entry).toFixed(1);
   }
 
   analysis.recommendation = {
@@ -375,12 +445,24 @@ export async function analyze(state, triggers, config) {
     risk_reward: Math.round(rr * 100) / 100,
     confidence,
     total_score: totalScore,
-    potential_profit_pct: potentialProfitPct,
-    potential_loss_pct: potentialLossPct,
+    potential_profit_pts: potentialProfitPts,
+    potential_loss_pts: potentialLossPts,
   };
 
-  analysis.potential_profit_pct = potentialProfitPct;
-  analysis.potential_loss_pct = potentialLossPct;
+  // ─── Context Summary (Phase 1) ───
+  analysis.context = {
+    market_regime: marketRegime,
+    volatility: volatility,
+    openbb: openbb,
+    kronos: kronos,
+    regime_bonus: regimeBonus,
+    vol_adjustment: volAdjustment,
+    sentiment_bonus: sentimentBonus,
+    kronos_bonus: kronosBonus,
+  };
+
+  analysis.potential_profit_pts = potentialProfitPts;
+  analysis.potential_loss_pts = potentialLossPts;
 
   return analysis;
 }
@@ -421,6 +503,13 @@ export function formatAnalysis(analysis) {
       output += `     Bollinger: Upper ${trend.bollinger_upper.toFixed(2)} | Mid ${trend.bollinger_middle.toFixed(2)} | Lower ${trend.bollinger_lower.toFixed(2)}\n`;
     }
   }
+  if (analysis.mtfTrend) {
+    const m = analysis.mtfTrend;
+    const mArrow = m.direction === 'bullish' ? '🟢' : m.direction === 'bearish' ? '🔴' : '⚪';
+    output += `\n  🔄 MULTI-TIMEFRAME (5m):\n`;
+    output += `     ${mArrow} 5m Trend: ${m.direction} (${m.score})\n`;
+    output += `     5m EMA: ${m.ema ? m.ema.toFixed(2) : 'N/A'} | 5m VWAP: ${m.vwap ? m.vwap.toFixed(2) : 'N/A'} | 5m ST: ${m.supertrend_dir}\n`;
+  }
   output += `\n`;
 
   // Scores
@@ -430,6 +519,38 @@ export function formatAnalysis(analysis) {
   output += `     Structure: ${structure?.direction || 'N/A'} (${structure?.score || 0})\n`;
   output += `     Total: ${rec?.total_score || 0} | Confidence: ${rec?.confidence || 0}%\n`;
   output += `\n`;
+
+  // Context (Phase 1)
+  if (analysis.context) {
+    const ctx = analysis.context;
+    output += `  🌐 CONTEXT:\n`;
+    if (ctx.market_regime) {
+      const mr = ctx.market_regime;
+      const mrEmoji = mr.regime === 'trending_up' ? '🟢' : mr.regime === 'trending_down' ? '🔴' : mr.regime === 'volatile' ? '⚡' : '⚪';
+      output += `     ${mrEmoji} Regime: ${mr.regime.replace('_', ' ').toUpperCase()} (ADX: ${mr.adx ?? 'N/A'})\n`;
+    }
+    if (ctx.volatility) {
+      const v = ctx.volatility;
+      const vEmoji = v.vol_regime === 'high' ? '🔴' : v.vol_regime === 'low' ? '🟢' : '🟡';
+      output += `     ${vEmoji} Vol: ${v.vol_regime.toUpperCase()} (ATR%: ${v.atr_pct ?? 'N/A'}%`;
+      if (v.iv_atm !== null) output += `, IV: ${v.iv_atm}%`;
+      if (v.vol_spread !== null) output += `, IV/RV: ${v.vol_spread}`;
+      output += `)\n`;
+    }
+    if (ctx.openbb?.available && ctx.openbb.sentiment) {
+      const s = ctx.openbb.sentiment;
+      output += `     📰 Sentiment: ${s.label || 'N/A'} (${s.score ?? 'N/A'})\n`;
+    }
+    if (ctx.kronos?.available && ctx.kronos.summary) {
+      const k = ctx.kronos.summary;
+      const kEmoji = k.direction === 'up' ? '📈' : '📉';
+      output += `     ${kEmoji} Kronos AI: ${k.direction.toUpperCase()} ${k.change_pct > 0 ? '+' : ''}${k.change_pct}% (${k.last_close?.toFixed(2)} → ${k.final_close?.toFixed(2)})\n`;
+    }
+    if (ctx.regime_bonus || ctx.vol_adjustment || ctx.sentiment_bonus || ctx.kronos_bonus) {
+      output += `     Bonus: Regime ${ctx.regime_bonus > 0 ? '+' : ''}${ctx.regime_bonus} | Vol ${ctx.vol_adjustment > 0 ? '+' : ''}${ctx.vol_adjustment} | Sent ${ctx.sentiment_bonus > 0 ? '+' : ''}${ctx.sentiment_bonus} | Kronos ${ctx.kronos_bonus > 0 ? '+' : ''}${ctx.kronos_bonus}\n`;
+    }
+    output += `\n`;
+  }
 
   // Recommendation
   if (rec && rec.action !== 'NO TRADE') {
@@ -442,11 +563,11 @@ export function formatAnalysis(analysis) {
     output += `     Target 2:   ${rec.target2}\n`;
     output += `     Risk:Reward: 1:${rec.risk_reward}\n`;
     output += `     Confidence: ${rec.confidence}%\n`;
-    if (rec.potential_profit_pct) {
-      output += `     Potential Profit: +${rec.potential_profit_pct}%\n`;
+    if (rec.potential_profit_pts) {
+      output += `     Potential Profit: +${rec.potential_profit_pts} pts\n`;
     }
-    if (rec.potential_loss_pct) {
-      output += `     Potential Loss:   -${rec.potential_loss_pct}%\n`;
+    if (rec.potential_loss_pts) {
+      output += `     Potential Loss:   -${rec.potential_loss_pts} pts\n`;
     }
     output += `\n`;
     output += `  💡 Enter trade? Type 'y' to confirm, 'n' to skip\n`;

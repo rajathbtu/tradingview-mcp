@@ -130,32 +130,33 @@ export function updatePosition(currentPrice, state, config) {
     }
   }
 
-  // 4. Trailing Stop (percentage-based)
+  // 4. Trailing Stop (ATR-based points)
   if (exitConfig.trailing_stop) {
-    const activationPct = (exitConfig.trailing_activation_pct || 0.3) / 100;
-    const trailPct = (exitConfig.trailing_distance_pct || 0.15) / 100;
+    const atr = position.atr || 1;
+    const activationPts = (exitConfig.trailing_activation_multiplier || 0.3) * atr;
+    const trailPts = (exitConfig.trailing_distance_multiplier || 0.15) * atr;
 
     if (!trailingStopPrice) {
-      // Check if profit % is enough to activate trailing
-      const pnlPct = Math.abs(position.pnl_pct) / 100;
-      if (pnlPct >= activationPct) {
+      // Check if profit in points is enough to activate trailing
+      const pnlPts = Math.abs(position.pnl);
+      if (pnlPts >= activationPts) {
         if (position.direction === 'BUY') {
-          trailingStopPrice = currentPrice * (1 - trailPct);
+          trailingStopPrice = currentPrice - trailPts;
         } else {
-          trailingStopPrice = currentPrice * (1 + trailPct);
+          trailingStopPrice = currentPrice + trailPts;
         }
         position.trailing_activated = true;
       }
     } else {
       // Update trailing stop
       if (position.direction === 'BUY') {
-        const newStop = currentPrice * (1 - trailPct);
+        const newStop = currentPrice - trailPts;
         if (newStop > trailingStopPrice) trailingStopPrice = newStop;
         if (currentPrice <= trailingStopPrice) {
           return { reason: 'trailing_stop', price: currentPrice, message: `Trailing stop hit at ${currentPrice}` };
         }
       } else {
-        const newStop = currentPrice * (1 + trailPct);
+        const newStop = currentPrice + trailPts;
         if (newStop < trailingStopPrice) trailingStopPrice = newStop;
         if (currentPrice >= trailingStopPrice) {
           return { reason: 'trailing_stop', price: currentPrice, message: `Trailing stop hit at ${currentPrice}` };

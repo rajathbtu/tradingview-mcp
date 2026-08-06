@@ -192,11 +192,12 @@ export async function getTargetInfo() {
 
 export async function evaluate(expression, opts = {}) {
   const c = await getClient(opts.context ?? null);
+  const { context, ...cdpOpts } = opts;
   const result = await c.Runtime.evaluate({
     expression,
     returnByValue: true,
     awaitPromise: opts.awaitPromise ?? false,
-    ...opts,
+    ...cdpOpts,
   });
   if (result.exceptionDetails) {
     const msg = result.exceptionDetails.exception?.description

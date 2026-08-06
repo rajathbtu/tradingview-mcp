@@ -4,95 +4,115 @@
  * Configure symbols, conditions, and exit strategy.
  * All indicators calculated LOCALLY from OHLCV bars — no premium TV required.
  * 
- * Targets are set for meaningful scalping: minimum 5% potential profit.
- * Recommendations require MULTIPLE cross-verified signals before triggering.
+ * When symbol is NIFTY, automatically analyzes NIFTY options chain
+ * for current week, next week, and next-next week expiries.
+ * 
+ * Targets are ATR-BASED (points, not percentages) for realistic scalping.
+ * NIFTY at 24500: ATR ≈ 20-30 points on 1m chart.
+ * Option targets: 50% of premium (e.g., premium 100, target 150, SL 50)
+ * Max hold: 10 minutes.
  */
 
 const config = {
   // ─── Symbol to monitor ───
-  symbol: 'BTCUSD',          // Change to NSE:NIFTY, BTCUSD, AAPL, etc.
+  symbol: 'NIFTY',          // Change to BTCUSD, AAPL, etc.
   timeframe: '1',              // 1 = 1 minute chart for fastest signals
 
   // ─── Polling ───
   poll_interval_ms: 5000,      // Check every 5 seconds
 
   // ─── Trigger Conditions ───
-  // Set any condition to true to enable it.
-  // Multiple conditions = OR logic (any one triggers analysis).
   conditions: {
-    // --- Trend triggers (locally calculated) ---
-    ema9_cross: true,           // Price crosses above/below EMA 9
-    vwap_cross: true,           // Price crosses above/below VWAP
-    supertrend_flip: true,      // Supertrend changes direction
-    
-    // --- Momentum triggers (locally calculated) ---
-    rsi_overbought_oversold: true,  // RSI crosses above 70 (overbought) or below 30 (oversold)
-    bollinger_breakout: true,       // Price breaks above/below Bollinger Bands
-    
-    // --- Price action triggers ---
-    breakout_1min_high: true,   // Price breaks above previous 1m candle high
-    breakout_1min_low: true,    // Price breaks below previous 1m candle low
-    round_number: true,         // Price crosses a round number (e.g., 4050, 24400)
-    
-    // --- Momentum triggers ---
-    volume_spike: true,         // Volume > 1.5x average on current bar
-    price_move_0_2_pct: true,   // Price moves >0.2% in one 1m candle
-    
-    // --- Always-on ---
-    always_analyze: false,      // If true, runs analysis every cycle (debug)
+    ema9_cross: true,
+    vwap_cross: true,
+    supertrend_flip: true,
+    rsi_overbought_oversold: true,
+    bollinger_breakout: true,
+    breakout_1min_high: true,
+    breakout_1min_low: true,
+    round_number: true,
+    volume_spike: true,
+    price_move_0_2_pct: true,
+    always_analyze: false,
   },
 
   // ─── Thresholds ───
   thresholds: {
-    volume_spike_multiplier: 1.5,  // Trigger when volume > 1.5x MA
-    min_price_move_pct: 0.2,       // Trigger on 0.2% price move
-    round_number_range: 5,         // Round number detection range (e.g., ±5 for 4050)
-    rsi_overbought: 70,            // RSI overbought threshold
-    rsi_oversold: 30,              // RSI oversold threshold
-    bollinger_period: 20,          // Bollinger Bands period
-    bollinger_std: 2,              // Bollinger Bands standard deviations
+    volume_spike_multiplier: 1.5,
+    min_price_move_pct: 0.2,
+    round_number_range: 5,
+    rsi_overbought: 70,
+    rsi_oversold: 30,
+    bollinger_period: 20,
+    bollinger_std: 2,
   },
 
   // ─── Analysis Settings ───
   analysis: {
-    ohlcv_bars: 50,            // Bars to fetch for analysis (need 20+ for Bollinger/RSI)
-    include_options: false,     // Set true for NSE:NIFTY to read options chain
-    max_strikes: 5,            // ATM-2 to ATM+2
+    ohlcv_bars: 50,
+    include_options: true,      // For NIFTY: analyze options chain
+    max_strikes: 5,             // ATM-2 to ATM+2
     
     // ─── Cross-Verification Requirements ───
-    // A trade recommendation requires MULTIPLE confirming signals
-    min_confirming_signals: 3,     // At least 3 indicators must agree
-    require_trend_alignment: true, // Trend must align with trade direction
-    require_momentum_alignment: true, // Momentum must align with trade direction
-    min_confidence_pct: 50,        // Minimum 50% confidence to recommend
+    min_confirming_signals: 3,
+    require_trend_alignment: true,
+    require_momentum_alignment: true,
+    min_confidence_pct: 50,
+  },
+
+  // ─── Options Analysis ───
+  options: {
+    enabled: true,              // Auto-analyze NIFTY options
+    expiries: ['current', 'next', 'next_next'],  // Which expiries to scan
+    atm_range: 2,               // ATM ±2 strikes
+    min_premium: 20,            // Minimum premium to consider
+    max_premium: 200,           // Maximum premium to consider
+    target_multiplier: 1.25,    // Target = premium * 1.25 (25% profit — achievable in 5-10 min)
+    stop_loss_multiplier: 0.85, // SL = premium * 0.85 (15% loss) → R:R = 1:1.67
+    min_liquidity_volume: 100,  // Minimum volume for liquidity
+    min_score: 50,              // Minimum score (out of 100) to recommend
   },
 
   // ─── Exit Strategy (after trade entry) ───
   exit: {
-    // Profit targets (in PERCENTAGE)
-    // Minimum 5% potential profit for meaningful scalping
-    target1_pct: 3.0,          // T1 = 3% profit
-    target2_pct: 5.0,          // T2 = 5% profit (minimum viable)
-    stop_loss_pct: 1.5,        // SL = 1.5% loss
+    target1_multiplier: 0.5,   // T1 = 0.5 * ATR
+    target2_multiplier: 1.0,   // T2 = 1.0 * ATR
+    stop_loss_multiplier: 0.3, // SL = 0.3 * ATR
     
-    // Trailing stop (in percentage)
-    trailing_stop: true,       // Enable trailing stop
-    trailing_activation_pct: 2.0,  // Activate trail after 2% profit
-    trailing_distance_pct: 1.0,    // Trail distance = 1%
+    trailing_stop: true,
+    trailing_activation_multiplier: 0.3,
+    trailing_distance_multiplier: 0.15,
     
-    // Time-based exit
-    max_hold_seconds: 600,     // Max 10 minutes in trade
-    exit_on_reversal: true,    // Exit if conditions reverse
-    
-    // Polling during trade
-    exit_poll_ms: 3000,        // Check exit every 3 seconds
+    max_hold_seconds: 600,
+    exit_on_reversal: true,
+    exit_poll_ms: 3000,
   },
 
   // ─── Notifications ───
   notifications: {
-    sound: true,               // Terminal bell on trigger
-    show_analysis: true,       // Show full analysis on trigger
-    show_recommendation: true, // Show buy/sell recommendation
+    sound: true,
+    show_analysis: true,
+    show_recommendation: true,
+  },
+
+  // ─── Context Enrichment (Phase 1) ───
+  enrichment: {
+    enabled: true,              // Master switch
+    market_regime: true,        // Detect trending/ranging/volatile
+    volatility: true,           // ATR%, realized vol, IV context
+    include_options: true,      // Use options chain for IV context
+    openbb: {
+      enabled: true,            // Fetch fundamentals/sentiment from OpenBB
+      base_url: 'http://localhost:8000',
+      cache_ttl_ms: 60000,      // Cache fundamentals for 60s
+    },
+    kronos: {
+      enabled: true,            // AI price forecast from Kronos
+      base_url: 'http://localhost:8001',
+      pred_len: 5,              // Forecast 5 bars ahead
+      lookback: 200,            // Use 200 bars of context
+      cache_ttl_ms: 300000,     // Cache forecast for 5min
+    },
   },
 };
 

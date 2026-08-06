@@ -4,17 +4,17 @@
  * Polls TradingView every 5 seconds via the existing MCP CDP connection,
  * checks trigger conditions, and fires full analysis when conditions are met.
  * 
- * REUSES the proven connection infrastructure from src/connection.js
- * with the exact same API paths as the working MCP tools.
- * 
  * ALL indicators calculated LOCALLY from OHLCV bars:
  * - EMA 9, VWAP, Supertrend
  * - RSI (14), Bollinger Bands (20,2)
  * - Volume analysis, price action patterns
+ * - MULTI-TIMEFRAME: aggregates 1m → 5m bars for trend confirmation
+ * 
  * No premium TradingView indicators required.
  */
 
 import { evaluate, getClient } from '../src/connection.js';
+import { enrichContext } from './context-enricher.js';
 
 let lastState = {};
 let triggerCount = 0;
@@ -29,6 +29,10 @@ let lastRSI = null;
 
 // Track Bollinger Band position for breakout detection
 let lastBollingerPosition = null;
+
+// Signal persistence: track direction over last N polls
+const SIGNAL_PERSISTENCE_COUNT = 3;
+let signalHistory = [];
 
 // Exact same path as proven in src/connection.js KNOWN_PATHS
 const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
@@ -67,38 +71,6 @@ async function fetchCurrentState() {
         for (var i = startIdx; i <= lastIdx; i++) {
           var b = bars.valueAt(i);
           if (b) result.bars.push({ t: b[0], o: b[1], h: b[2], l: b[3], c: b[4], v: b[5] || 0 });
-        }
-        
-        // Try to get TV studies (may be empty on free accounts)
-        var widget = chart._chartWidget;
-        if (!widget) return result;
-        var model = widget.model();
-        if (!model) return result;
-        var sources = model.model().dataSources();
-        for (var si = 0; si < sources.length; si++) {
-          var s = sources[si];
-          if (!s.metaInfo) continue;
-          try {
-            var meta = s.metaInfo();
-            var name = meta.description || meta.shortDescription || '';
-            if (!name) continue;
-            var vals = {};
-            try {
-              var dwv = s.dataWindowView();
-              if (dwv) {
-                var items = dwv.items();
-                if (items) {
-                  for (var ii = 0; ii < items.length; ii++) {
-                    var item = items[ii];
-                    if (item && item._value && item._value !== '\\u2205' && item._title) {
-                      vals[item._title] = String(item._value);
-                    }
-                  }
-                }
-              }
-            } catch(e) {}
-            if (Object.keys(vals).length > 0) result.studies[name] = vals;
-          } catch(e) {}
         }
       } catch(e) {
         return { error: (e.message || 'Unknown error').substring(0, 200) };
@@ -216,8 +188,75 @@ function calcBollingerBands(bars, period = 20, stdDev = 2) {
 }
 
 /**
- * Check if any trigger conditions are met
- * ALL indicators calculated LOCALLY from OHLCV bars
+ * Aggregate 1m bars into higher timeframe bars (e.g., 5m)
+ * Groups every `groupSize` bars into one OHLCV bar
+ */
+function aggregateBars(bars, groupSize = 5) {
+  if (!bars || bars.length < groupSize) return [];
+  
+  const result = [];
+  for (let i = 0; i + groupSize <= bars.length; i += groupSize) {
+    const group = bars.slice(i, i + groupSize);
+    const first = group[0];
+    const last = group[group.length - 1];
+    result.push({
+      t: first.t,
+      o: first.o,
+      h: Math.max(...group.map(b => b.h)),
+      l: Math.min(...group.map(b => b.l)),
+      c: last.c,
+      v: group.reduce((sum, b) => sum + b.v, 0),
+    });
+  }
+  return result;
+}
+
+/**
+ * Get multi-timeframe trend from aggregated bars
+ */
+function getMultiTimeframeTrend(bars) {
+  // Aggregate 1m bars into 5m bars
+  const bars5m = aggregateBars(bars, 5);
+  if (bars5m.length < 4) return { direction: 'neutral', score: 0, ema: null };
+  
+  // Calculate 5m EMA
+  const ema5m = calcEMA(bars5m, 9);
+  // Calculate 5m VWAP
+  const vwap5m = calcVWAP(bars5m);
+  // Calculate 5m Supertrend
+  const st5m = calcSupertrend(bars5m);
+  
+  let score = 0;
+  const last = bars5m[bars5m.length - 1];
+  
+  if (ema5m && last.c > ema5m) score += 2;
+  else if (ema5m) score -= 2;
+  
+  if (vwap5m && last.c > vwap5m) score += 1;
+  else if (vwap5m) score -= 1;
+  
+  if (st5m.direction === 'up') score += 2;
+  else if (st5m.direction === 'down') score -= 2;
+  
+  // Check if last 2 5m bars are making higher highs / lower lows
+  if (bars5m.length >= 2) {
+    const b1 = bars5m[bars5m.length - 1];
+    const b2 = bars5m[bars5m.length - 2];
+    if (b1.h > b2.h && b1.c > b2.c) score += 1;
+    if (b1.h < b2.h && b1.c < b2.c) score -= 1;
+  }
+  
+  return {
+    direction: score >= 3 ? 'bullish' : score <= -3 ? 'bearish' : 'neutral',
+    score,
+    ema: ema5m,
+    vwap: vwap5m,
+    supertrend_dir: st5m.direction,
+  };
+}
+
+/**
+ * Check if trigger conditions are met
  */
 function checkConditions(state, config) {
   const { conditions, thresholds } = config;
@@ -270,19 +309,15 @@ function checkConditions(state, config) {
     const oversold = thresholds.rsi_oversold || 30;
     
     if (lastRSI !== null) {
-      // Crossed above overbought
       if (localRSI >= overbought && lastRSI < overbought) {
         triggers.push({ type: 'rsi_overbought', detail: `RSI crossed above ${overbought} (${localRSI.toFixed(1)}) — overbought` });
       }
-      // Crossed below oversold
       if (localRSI <= oversold && lastRSI > oversold) {
         triggers.push({ type: 'rsi_oversold', detail: `RSI crossed below ${oversold} (${localRSI.toFixed(1)}) — oversold` });
       }
-      // Crossed back below overbought (bearish signal)
       if (localRSI < overbought && lastRSI >= overbought) {
         triggers.push({ type: 'rsi_exit_overbought', detail: `RSI dropped below ${overbought} (${localRSI.toFixed(1)}) — exiting overbought` });
       }
-      // Crossed back above oversold (bullish signal)
       if (localRSI > oversold && lastRSI <= oversold) {
         triggers.push({ type: 'rsi_exit_oversold', detail: `RSI rose above ${oversold} (${localRSI.toFixed(1)}) — exiting oversold` });
       }
@@ -368,6 +403,8 @@ export async function startMonitoring(config, onTrigger, onTick) {
   console.log(`  Polling: every ${config.poll_interval_ms}ms`);
   console.log(`  Conditions: ${Object.entries(config.conditions).filter(([,v]) => v).map(([k]) => k).join(', ')}`);
   console.log(`  Indicators: EMA9, VWAP, Supertrend, RSI(14), Bollinger(20,2), Volume, Price Action`);
+  console.log(`  Multi-TF: 5m aggregation from 1m bars (trend confirmation)`);
+  console.log(`  Persistence: ${SIGNAL_PERSISTENCE_COUNT} consecutive polls required`);
   console.log(`═══════════════════════════════════════════\n`);
 
   let cycleCount = 0;
@@ -401,7 +438,7 @@ export async function startMonitoring(config, onTrigger, onTick) {
         }
       }
 
-      // Calculate all local indicators
+      // Calculate all local 1m indicators
       const atr = calcATR(state.bars);
       state.atr = atr;
       state.localEMA = calcEMA(state.bars, 9);
@@ -410,9 +447,27 @@ export async function startMonitoring(config, onTrigger, onTick) {
       state.localRSI = calcRSI(state.bars, 14);
       state.localBB = calcBollingerBands(state.bars, config.thresholds.bollinger_period || 20, config.thresholds.bollinger_std || 2);
 
+      // Calculate multi-timeframe (5m) trend from aggregated 1m bars
+      const mtfTrend = getMultiTimeframeTrend(state.bars);
+      state.mtfTrend = mtfTrend;
+
+      // ─── Context Enrichment (Phase 1) ───
+      // Adds market regime, volatility, and OpenBB context to state
+      // Non-blocking: if enrichment fails, pipeline continues with state.context = null
+      try {
+        await enrichContext(state, config);
+      } catch (e) {
+        state.context = null;
+        if (cycleCount % 20 === 0) {
+          console.error(`  ⚠ Enrichment error: ${e.message.substring(0, 100)}`);
+        }
+      }
+
       // Heartbeat
       if (cycleCount % 20 === 0) {
-        console.log(`  💓 [${new Date().toLocaleTimeString()}] ${state.symbol || '?'} @ ${state.lastBar?.c || '?'} | ATR: ${atr.toFixed(2)} | RSI: ${state.localRSI?.toFixed(1) || 'N/A'} | Bars: ${state.bars?.length || 0}`);
+        const regime = state.context?.market_regime?.regime || 'N/A';
+        const volRegime = state.context?.volatility?.vol_regime || 'N/A';
+        console.log(`  💓 [${new Date().toLocaleTimeString()}] ${state.symbol || '?'} @ ${state.lastBar?.c || '?'} | ATR: ${atr.toFixed(2)} | RSI: ${state.localRSI?.toFixed(1) || 'N/A'} | 5m: ${mtfTrend.direction} (${mtfTrend.score}) | Regime: ${regime} | Vol: ${volRegime} | Bars: ${state.bars?.length || 0}`);
       }
 
       // Tick callback
